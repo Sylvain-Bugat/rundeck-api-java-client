@@ -42,6 +42,8 @@ import org.rundeck.api.util.DocumentContentProducer;
 
 import java.io.*;
 import java.net.ProxySelector;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.security.KeyManagementException;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
@@ -685,42 +687,57 @@ class ApiCall {
     private String login(HttpClient httpClient) throws RundeckApiLoginException {
         String sessionID = null;
 
-        // 1. call expected GET request
-        String location = client.getUrl();
-
+        URI location;
         try {
-            HttpGet getRequest = new HttpGet(location);
-            HttpResponse response = httpClient.execute(getRequest);
+            location = new URI( client.getUrl() );
+        } catch (URISyntaxException e) {
+            throw new RundeckApiLoginException("Invalid Rundeck address:" + client.getUrl(), e);
+        }
+        boolean setCookie=true;     
+        
+        while (true) {
+            
+             // 1. call expected GET request
+            if(setCookie) {
+                try {
+                    HttpGet getRequest = new HttpGet(location);
+                    HttpResponse response = httpClient.execute(getRequest);
 
-            // sessionID stored in case user wants to cache it for reuse
-            Header cookieHeader = response.getFirstHeader("Set-Cookie");
-            if (cookieHeader != null) {
-                String cookieStr = cookieHeader.getValue();
-                if (cookieStr != null) {
-                    int i1 = cookieStr.indexOf("JSESSIONID=");
-                    if (i1 >= 0) {
-                        cookieStr = cookieStr.substring(i1 + "JSESSIONID=".length());
-                        int i2 = cookieStr.indexOf(";");
-                        if (i2 >= 0) {
-                            sessionID = cookieStr.substring(0, i2);
+                    // sessionID stored in case user wants to cache it for reuse
+                    Header cookieHeader = response.getFirstHeader("Set-Cookie");
+                    if (cookieHeader != null) {
+                        String cookieStr = cookieHeader.getValue();
+                        if (cookieStr != null) {
+                            int i1 = cookieStr.indexOf("JSESSIONID=");
+                            if (i1 >= 0) {
+                                cookieStr = cookieStr.substring(i1 + "JSESSIONID=".length());
+                                int i2 = cookieStr.indexOf(";");
+                                if (i2 >= 0) {
+                                    sessionID = cookieStr.substring(0, i2);
+                                }
+                            }
                         }
                     }
+
+                    try {
+                        EntityUtils.consume(response.getEntity());
+                    } catch (IOException e) {
+                        throw new RundeckApiLoginException("Failed to consume entity (release connection)", e);
+                    }
+                } catch (IOException e) {
+                    throw new RundeckApiLoginException("Failed to get request on " + location, e);
                 }
+
+                // 2. then call POST login request
+                try {
+                    location = new URI( location.toString() + "/j_security_check" );
+                } catch (URISyntaxException e) {
+                    throw new RundeckApiLoginException("Invalid Rundeck security check address:" + location.toString() + "/j_security_check", e);
+                }
+                
+                setCookie = false;
             }
 
-            try {
-                EntityUtils.consume(response.getEntity());
-            } catch (IOException e) {
-                throw new RundeckApiLoginException("Failed to consume entity (release connection)", e);
-            }
-        } catch (IOException e) {
-            throw new RundeckApiLoginException("Failed to get request on " + location, e);
-        }
-
-        // 2. then call POST login request
-        location += "/j_security_check";
-
-        while (true) {
             try {
                 HttpPost postLogin = new HttpPost(location);
                 List<BasicNameValuePair> params = new ArrayList<BasicNameValuePair>();
@@ -732,7 +749,18 @@ class ApiCall {
 
                 if (response.getStatusLine().getStatusCode() / 100 == 3) {
                     // HTTP client refuses to handle redirects (code 3xx) for POST, so we have to do it manually...
-                    location = response.getFirstHeader("Location").getValue();
+                    String redirectLocation = response.getFirstHeader("Location").getValue();
+                    try {
+                        String originalHost=location.getHost();
+                        location = new URI( redirectLocation );
+                        //Change hostname detection, return to step 1 with the real Rundeck host
+                        if( !originalHost.equals(location.getHost())) {
+                            setCookie = true;
+                            location = new URI( location.getScheme() + "://" + location.getHost() + ':' + location.getPort() );
+                        }
+                    } catch (URISyntaxException e) {
+                        throw new RundeckApiLoginException("Failed to redirect to URI:" + redirectLocation, e);
+                    }
                     try {
                         EntityUtils.consume(response.getEntity());
                     } catch (IOException e) {
@@ -747,6 +775,7 @@ class ApiCall {
                 }
 
                 try {
+
                     String content = EntityUtils.toString(response.getEntity(), Consts.UTF_8);
                     if (StringUtils.contains(content, "j_security_check")) {
                         throw new RundeckApiLoginException("Login failed for user " + client.getLogin());
@@ -769,7 +798,6 @@ class ApiCall {
 
         return sessionID;
     }
-
 
     /**
      * Instantiate a new {@link HttpClient} instance, configured to accept all SSL certificates
